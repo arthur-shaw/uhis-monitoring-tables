@@ -1,0 +1,1333 @@
+---
+title: "Field check tables"
+subtitle: "`r paste0('From ', params$report_start, ' to ', params$report_end)`"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      toc_depth: 3
+params:
+  reject_proj_dir: ""
+  main_file_dta: ""
+  report_start: ""
+  report_end: ""
+---
+
+```{r knitr_options, include = FALSE, echo = FALSE, warning = FALSE, message = FALSE}
+
+# knitr options
+knitr::opts_chunk$set(
+	echo = FALSE, 
+	warning = FALSE,
+	message = FALSE,
+	out.width = '100%')
+
+```
+
+```{css}
+
+h1 {
+    color: #0F2B1D;
+}
+
+h2 {
+    color: #516A5D;
+}
+
+```
+
+```{r, set_dirs}
+
+proj_dir <- params$reject_proj_dir
+
+# data
+data_dir <- paste0(params$reject_proj_dir, "data/") # /data/
+resource_dir <- paste0(data_dir, "00_resource/")  # /00_resource/
+download_dir <- paste0(data_dir, "01_downloaded/")  # /01_downloaded/
+combined_dir <- paste0(data_dir, "02_combined/")  # /02_combined/
+derived_dir <- paste0(data_dir, "03_derived/")   # /03_derived/
+
+# outputs
+output_dir <- paste0(params$reject_proj_dir, "output/")    # /output/
+
+# 
+statuses_to_reject <- c(100, 120)
+
+```
+
+```{r, load_libaries}
+
+# load libraries whose functions don't have an explicit namespace when used
+library(dplyr)
+library(lubridate)
+
+```
+
+```{r define_utils}
+# NOTE: copied over from 50x30 project
+
+# create data frames:
+# parcel
+# parcel_plot
+# parcel_plot_crop
+# crop
+
+
+#' Extract variable values from value labels
+#' 
+#' First, extract the 'labels' attribute from the column of interest. 
+#' Then, returns a numeric vector of possible values
+#' Next, remove names of each vector element
+#' 
+#' @param df Data frame
+#' @param var Variable of interest
+#' 
+#' @return Numeric vector. Values of a labelled variable.
+#' 
+#' @importFrom dplyr `%>%` pull
+extract_var_values <- function(
+    df,
+    var
+) {
+
+    base::attr({{df}} %>% dplyr::pull({{var}}), which = "labels") %>% base::unname()
+    # Note: it appears that one doesn't need to import `{{`
+
+}
+
+# first, convert labelled columns to factors, replacing numeric values with characters
+# then, extract the character levels, which correspond
+# source: Senegal moduleResponseRate.R
+#' Extract labels from value labels
+#' 
+#' First, extract the 'labels' attribute from the column of interest.
+#' Then, returns a numeric vector of possible values
+#' Next, keep the names of each vector element--that is, the string value label
+#' 
+#' @return Numeric vector. Values of a labelled variable.
+#' 
+#' @return Character vector. Character labels of a labelled variable.
+#' 
+#' @importFrom dplyr `%>%` pull
+extract_var_labels <- function(
+    df,
+    var
+) {
+
+    base::attr({{df}} %>% dplyr::pull({{var}}), which = "labels") %>% base::names()
+    # Note: it appears that one doesn't need to import `{{`
+
+}
+
+
+# TODO: write this with inspiration from lines 188 and 189 of moduleResponseRate.R
+#' Create column labels
+#' 
+#' Create {gt} column labels that combine labels and values in in the following format: `"Label (value)"`
+#' 
+#' @importFrom glue glue
+#' @importFrom dplyr `%>%`
+#' @importFrom stringr str_subset
+#' @importFrom purrr map
+#' @importFrom gt html
+create_col_labels <- function(
+    labels,
+    values,
+    df, 
+    pattern
+) {
+
+    # compose the column label
+    column_lbl_text <- glue::glue("{labels}<br>({values})")
+
+    column_names <- names(df) %>% stringr::str_subset(pattern = pattern)
+
+    column_lbls_list <- setNames(as.list(column_lbl_text), column_names)
+
+    column_lbls_html <- purrr::map(.x = column_lbls_list, .f = ~ gt::html(.x))
+
+    return(column_lbls_html)
+
+}
+
+#' Create dummies from a variable
+#' 
+#' Create a dummy for each level of a labelled variable
+#' 
+#' @param df Data frame
+#' @param var Bare variable name of a 
+#' 
+#' @return Data frame with dummies added
+#' 
+#' @importFrom purrr map_dfc
+#' @importFrom dplyr transmute
+#' @importFrom stringr str_replace
+#' @importFrom rlang `:=`
+create_dummies <- function(
+    df,
+    var
+) {
+
+    # determine values
+    values <- extract_var_values(df = {{df}}, var = {{var}})
+
+
+    dummies <- purrr::map_dfc(
+        .x = values,
+        .f = ~ dplyr::transmute(
+            {{df}}, 
+            "{{var}}__{stringr::str_replace(.x, '-', 'n')}" := {{var}} == .x
+        )
+    )
+
+    cbind(df, dummies)
+
+}
+
+# file_name -> ID var
+
+#' Replace `NaN` and `Inf` with `NA_real_`
+#' 
+#' Replace NaN, which results from division by 0, with NA. This makes data destined for tables easier to handle.
+#' 
+#' @param df Data frame
+#' 
+#' @importFrom dplyr `%>%` mutate across 
+replace_nan_inf <- function(df) {
+
+    df %>%
+    dplyr::mutate(
+        dplyr::across(
+            .cols = where(is.numeric),
+            # note: using base::ifelse() rather than dplyr::if_else() to avoid type issues
+            .fns = ~ ifelse(
+                test = is.nan(.x), 
+                yes = NA_real_,
+                no = .x
+            )
+        ),
+        dplyr::across(
+            .cols = where(is.numeric),
+            .fns = ~ ifelse(
+                test = is.infinite(.x), 
+                yes = NA_real_,
+                no = .x
+            )
+        )
+    )
+
+}
+
+#' Construct a quosure for multi-select questions
+#' 
+#' Creates a quosure of the form: `varname__1 == 1 | varname__7 == 1`.
+#' 
+#' @param varname Character. Variable name, as it appears in SuSo Designer, for the multi-select question of interest.
+#' @param vals Numeric vector. Answer options
+#' 
+#' @return Quosure
+#' 
+#' @importFrom rlang parse_quo global_env
+make_multi_select_quos <- function(
+    varname,
+    vals
+) {
+
+    # construct expression as string
+    # of the form `varname__1 == 1 | varname__7 == 1`
+    expr_string <- paste0(
+        varname, "__", 
+        ifelse(vals > 0, vals, gsub(x = vals, pattern = "-", replacement = "n")), " == 1", 
+        collapse = " | "
+    )
+
+    # parse string as quosure
+    rlang::parse_quo(expr_string, env = rlang::global_env())
+
+}
+
+# TODO: consider "passing the dots" to `gt::tab_options()`
+
+#' Apply style to tables
+#' 
+#' Apply styles from `gt::tab_options()` to tables
+#' 
+#' @param df Data frame
+#' @param heading_color Character. Hex color for table header background color.
+#' @param column_label_color Character. Hex color for column label background color.
+#' @param row_group_color  Character. Hex color for row group background color.
+#' 
+#' @export 
+style_table <- function(
+    df, 
+    heading_color = "#0F2B1D",
+    column_label_color = "#264535",
+    row_group_color = "#516A5D"
+) {
+
+    df %>%
+    # apply colors to header, column labels, and row groups
+    gt::tab_options(
+        heading.background.color = heading_color,
+        column_labels.background.color = column_label_color,
+        row_group.background.color = row_group_color
+    ) %>%
+    # replace NA with ---
+    gt::fmt_missing(columns = everything())
+
+}
+
+```
+
+```{r, define_table_funs}
+#' Make parcels per household table
+#' 
+#' @param df Data frame of parcels.
+#' @param cases Data frame of cases to include in analysis
+#' @param use_var Character. Parcel use variable
+#' @param use_vals Numeric vector. Values that correspond to an agricultural use
+#' @param group_var Character. Grouping variable
+#' 
+#' @return {gt} table object
+#' 
+#' @importFrom rlang sym `!!`
+#' @importFrom dplyr `%>%` left_join mutate if_else group_by summarise n_distinct n ungroup across select
+#' 
+#' @export
+parcels_per_hhold <- function(
+    parcel_df, # parcels df
+    cases, # either df or character vector of interview__id for cases to include
+    parcel_id_var, 
+    use_var = NULL,
+    use_vals = NULL,
+    group_var
+) {
+
+    # make group variable into symbol for later evaluation
+    group_var <- rlang::sym(group_var)
+    parcel_id_var <- rlang::sym(parcel_id_var)
+
+    # construct a quosure that describes agricultural parcels
+    if (!is.null(use_var) & !is.null(use_vals)) {
+        parcel_quo <- make_multi_select_quos(
+            varname = use_var,
+            vals = use_vals
+        )
+    }
+
+    # compute parcel statistics
+    parcel_stats <- parcel_df %>%
+        dplyr::right_join(cases, by = "interview__id") %>%
+        {
+            if (!is.null(use_var)) {
+                dplyr::mutate(., 
+                    ag = dplyr::if_else(
+                        condition = !!parcel_quo, 
+                        true = 1, 
+                        false = 0, 
+                        missing = 0
+                    ),
+                    non_ag = dplyr::if_else(ag == 0, 1, 0, 0)
+                )
+            } else {
+                .
+            }
+
+        } %>%
+        dplyr::group_by(!!group_var) %>%
+        {
+            if (!is.null(use_var)) {
+                dplyr::summarise(., 
+                    interviews = dplyr::n_distinct(interview__id, na.rm = TRUE),
+                    parcels = dplyr::n_distinct(interview__id, !!parcel_id_var, na.rm = TRUE),
+                    ag = sum(ag, na.rm = TRUE),
+                    non_ag = sum(non_ag, na.rm = TRUE)
+                )       
+            } else {
+                dplyr::summarise(., 
+                    interviews = n_distinct(interview__id, na.rm = TRUE),
+                    parcels = dplyr::n_distinct(interview__id, !!parcel_id_var, na.rm = TRUE)
+                )
+            }
+        } %>%
+        ungroup() %>%
+        {
+            if (!is.null(use_var)) {
+                dplyr::mutate(., 
+                    dplyr::across(
+                        .cols = c(ag, non_ag),
+                        .fns = ~ .x / parcels
+                    )
+                )
+            } else {
+                .
+            }
+        } %>%
+        # replace_nan_inf() %>%
+        {
+            if (!is.null(use_var)) {
+                dplyr::select(., !!group_var, interviews, parcels, ag, non_ag)
+            } else {
+                dplyr::select(., !!group_var, interviews, parcels)
+            }
+        }
+
+    # create table
+    parcel_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Parcels per household, by team") %>%
+    gt::cols_label(
+        interviews = gt::html("Interviews<br>(N)"),
+        parcels = gt::html("Total parcels<br>(N)")
+    ) %>%
+    {
+        if (!is.null(use_var)) {
+            gt::cols_label(.,
+                ag = gt::html("Agricultural"),
+                non_ag = gt::html("Non-agricultural")
+            ) %>%
+            gt::tab_spanner(
+                label = "Parcels (%)",
+                columns = c(ag, non_ag)
+            ) %>%
+            gt::fmt_number(
+                columns = c(ag, non_ag),
+                decimals = 1,
+                scale_by = 100
+            )
+        } else {
+            .
+        }
+    } %>%
+    style_table()
+
+}
+
+
+#' Make parcel GPS measurement table
+#' 
+#' @param parcel_df Data frame of parcels.
+#' @param cases Data frame of cases to include in analysis
+#' @param gps_var Character. Name of column that includes GPS-measured area.
+#' @param not_measured_val Numeric. Special value that indicates area was not measured.
+#' @param why_no_gps_var Character. Name of column that captures reason why no GPS measurement was done.
+#' @param group_var Character. Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit parcels_per_hhold return
+#' 
+#' @importFrom rlang sym `!!` list2 as_name
+#' @importFrom dplyr `%>%` left_join mutate if_else group_by summarise n across ungroup starts_with matches
+#' @importFrom haven is_tagged_na
+#' @importFrom gt gt html tab_header cols_label tab_spanner fmt_number
+#' 
+#' @export 
+parcel_gps <- function(
+    parcel_df,
+    cases,
+    parcel_condit,
+    gps_var,
+    not_measured_val = -9999,
+    why_no_gps_var = NULL,
+    group_var
+) {
+
+    # TODO: add mechanism for filtering to ag parcels or do outside this function
+
+    # set variables to symbols for later evaluation
+    gps_var <- rlang::sym(gps_var)
+    if (!is.null(why_no_gps_var)) {
+        why_no_gps_var_txt <- why_no_gps_var
+        why_no_gps_var <- rlang::sym(why_no_gps_var)
+    }
+    group_var <- rlang::sym(group_var)
+
+    # compute GPS measurement stats
+    parcel_gps_stats <- parcel_df %>%
+        dplyr::filter(
+            ., 
+            !!rlang::parse_quo(
+                parcel_condit,
+                env = rlang::global_env()
+            )
+        ) %>%
+        dplyr::mutate(
+            to_measure = 1,
+            not_measured = dplyr::if_else(
+                condition = (
+                    # case 1: interviewer records not-recorded value
+                    (!!gps_var == not_measured_val) | 
+                    # case 2: SuSo numeric missing value
+                    # TODO: check whether this case is needed
+                    (!!gps_var == -999999999) | 
+                    # case 3: SuSo's extended missing value for Stata
+                    haven::is_tagged_na(!!gps_var)               
+                ),
+                true = 1,
+                false = 0,
+                missing = 0
+            )
+        ) %>%
+        dplyr::right_join(cases, by = c("interview__id", "interview__key")) %>%
+        { 
+            if (is.null(why_no_gps_var)) {
+                .
+            } else {
+                create_dummies(df = ., var = !!why_no_gps_var)
+            }
+        } %>%      
+        group_by(!!group_var) %>%
+        {
+            if (is.null(why_no_gps_var)) {
+                dplyr::summarise(.,
+                    parcels = sum(to_measure, na.rm = TRUE),
+                    not_measured = sum(not_measured, na.rm = TRUE)
+                )
+            } else {
+                dplyr::summarise(.,
+                    parcels = sum(to_measure, na.rm = TRUE),
+                    not_measured = sum(not_measured, na.rm = TRUE),
+                    dplyr::across(
+                        .cols = dplyr::starts_with(paste0(why_no_gps_var_txt, "__")),
+                        .fns = ~ sum(.x, na.rm = TRUE)
+                    )                    
+                )
+            }
+        } %>%
+        dplyr::ungroup() %>%   
+        {
+            if (is.null(why_no_gps_var)) {
+                .
+            } else {
+                dplyr::mutate(.,
+                    dplyr::across(
+                        .cols = starts_with(paste0(why_no_gps_var_txt, "__")),
+                        .fns = ~ .x / not_measured
+                    )
+                )            
+            }
+        } %>%
+        replace_nan_inf()
+
+    # compose labels of table columns
+    col_labels <- rlang::list2(
+        parcels = gt::html("To measure<br>(N)"),
+        not_measured = gt::html("Not measured<br>(N)")
+    )
+    # extract column labels
+    if (!is.null(why_no_gps_var)) {
+
+        lbls <- extract_var_labels(df = parcel_df, var = !!why_no_gps_var)
+        vals <- extract_var_values(df = parcel_df , var = !!why_no_gps_var)
+        col_labels2 <- create_col_labels(
+            labels = lbls,
+            values = vals,
+            df = parcel_gps_stats,
+            pattern = paste0(why_no_gps_var_txt, "_")
+        )
+
+        col_labels <- c(col_labels, col_labels2)
+
+    }
+
+    # compose table
+    parcel_gps_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Parcel GPS area measurement, by team") %>%
+    gt::cols_label(.list = col_labels) %>%
+    {
+        if (!is.null(why_no_gps_var)) {
+            gt::tab_spanner(.,
+                label = "Why not measured (%)",
+                columns = dplyr::starts_with(paste0(why_no_gps_var_txt, "_"))
+            )
+        } else {
+            .
+        }
+    }  %>%
+    {
+        if (!is.null(why_no_gps_var)) {
+            gt::fmt_number(.,
+                columns = dplyr::matches(paste0(why_no_gps_var_txt, "_")),
+                decimals = 1,
+                scale_by = 100
+            )
+        } else {
+            .
+        }
+    } %>%
+    style_table()
+
+}
+
+#' Make plots per parcel table
+#' 
+#' @param parcel_plot_df Data frame of parcel-plots.
+#' @param cases Data frame of cases to include in analysis.
+#' @param parcel_id_var Character. Name of parcel ID column.
+#' @param group_var Character. Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit parcel_gps return
+#' 
+#' @importFrom rlang sym `!!` as_name
+#' @importFrom dplyr `%>%` left_join group_by summarise n_distinct n ungroup mutate
+#' @importFrom gt gt tab_header cols_label html fmt_number
+#' 
+#' @export 
+plots_per_parcel <- function(
+    parcel_plot_df,
+    cases,
+    parcel_id_var,
+    group_var
+) {
+
+    # make group variable into symbol for later evaluation
+    parcel_id_var <- rlang::sym(parcel_id_var)
+    group_var <- rlang::sym(group_var)
+
+    # compute parcel-plot statistics
+    parcel_plot_stats <- cases %>%
+        dplyr::left_join(parcel_plot_df, by = "interview__id") %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::summarise(
+            n_parcels = dplyr::n_distinct(interview__id, !!parcel_id_var, na.rm = TRUE),
+            n_plots = dplyr::n()
+        ) %>%
+        ungroup() %>%
+        mutate(mean_plots = n_plots / n_parcels) %>%
+        replace_nan_inf()
+
+    # compose table
+    parcel_plot_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Number of plots per parcel, by team") %>%
+    gt::cols_label(
+        n_parcels = gt::html("Parcels<br>(N)"),
+        n_plots = gt::html("Plots<br>(N)"),
+        mean_plots = gt::html("Plots per parcel<br>(AVG)")
+    ) %>%
+    gt::fmt_number(
+        columns = c(mean_plots),
+        decimals = 1
+    ) %>%
+    style_table()
+
+}
+
+#' Make plot use table
+#' 
+#' @param plot_df Data frame of plots.
+#' @param cases Data frame of cases to include in analysis.
+#' @param plot_use_var Character. Name of plot use column.
+#' @param group_var Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit plots_per_parcel return
+#' 
+#' @importFrom rlang sym `!!` list2 as_name
+#' @importFrom dplyr `%>%` left_join group_by summarise n across starts_with ungroup mutate matches
+#' @importFrom gt gt html tab_header cols_label tab_spanner fmt_number
+#' 
+#' @export 
+plot_use <- function(
+    plot_df,
+    cases,
+    plot_use_var,
+    group_var
+) {
+
+    # make group variable into symbol for later evaluation
+    plot_use_var_txt <- plot_use_var
+    plot_use_var <- rlang::sym(plot_use_var)
+    group_var_txt <- group_var
+    group_var <- rlang::sym(group_var)
+
+    plot_use_stats <- cases %>%
+        dplyr::left_join(plot_df, by = "interview__id") %>%
+        create_dummies(var = !!plot_use_var) %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::summarise(
+            plots = dplyr::n(),
+            dplyr::across(
+                .cols = starts_with(paste0(plot_use_var_txt, "_")),
+                .fns = ~ sum(.x, na.rm = TRUE)
+            )
+        ) %>%
+        dplyr::ungroup() %>%
+        dplyr::mutate(
+            dplyr::across(
+                .cols = starts_with(paste0(plot_use_var_txt, "_")),
+                .fns = ~ .x / plots
+            )
+        ) %>%
+        replace_nan_inf()        
+
+    # compose table
+
+    # compile column labels
+    # ... for fixed-name vars
+    col_lbls1 <- rlang::list2(
+        plots = gt::html("Plots<br>(N)")
+    )
+
+    # ... from value labels
+    lbls <- extract_var_labels(df = plot_df, var = !!plot_use_var)
+    vals <- extract_var_values(df = plot_df , var = !!plot_use_var)
+    col_labels2 <- create_col_labels(
+        labels = lbls,
+        values = vals,
+        df = plot_use_stats,
+        pattern = paste0(plot_use_var_txt, "_")
+    )
+
+    # combine labels
+    col_labels <- c(col_lbls1, col_labels2)
+
+    # create display table
+    plot_use_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Plot use, by team") %>%
+    gt::cols_label(.list = col_labels) %>%
+    gt::tab_spanner(
+        columns = matches(paste0(plot_use_var_txt, "_")),
+        label = "Use (%)"
+    ) %>%
+    gt::fmt_number(
+        columns = matches(paste0(plot_use_var_txt, "_")),
+        decimals = 1,
+        scale_by = 100
+    ) %>%
+    style_table()
+
+}
+
+#' Make plot GPS measurement table
+#' 
+#' @param plot_df Data frame of plots.
+#' @param cases Data frame of cases to include in analysis.
+#' @param gps_var Character. Name of column that includes GPS-measured area.
+#' @param not_measured_val Numeric. Special value that indicates area was not measured.
+#' @param why_no_gps_var Character. Name of column that captures reason why no GPS measurement was done.
+#' @param group_var Character. Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit parcel_gps return
+#' 
+#' @importFrom rlang sym `!!` list2 as_name
+#' @importFrom dplyr `%>%` left_join mutate if_else group_by summarise n across starts_with ungroup matches
+#' @importFrom haven is_tagged_na
+#' @importFrom gt html gt tab_header cols_label tab_spanner fmt_number
+#' 
+#' @export 
+plot_gps <- function(
+    parcel_plot_df,
+    cases,
+    parcel_id_var,
+    plot_id_var,
+    parcel_condit = NULL,
+    plot_condit = NULL,
+    gps_var,
+    not_measured_val = -9999,
+    why_no_gps_var,
+    group_var
+) {
+
+    # set variables to symbols for later evaluation
+    parcel_id_var <- rlang::sym(parcel_id_var)
+    plot_id_var <- rlang::sym(plot_id_var)
+    gps_var <- rlang::sym(gps_var)
+    why_no_gps_var_txt <- why_no_gps_var
+    why_no_gps_var <- rlang::sym(why_no_gps_var)
+    group_var <- rlang::sym(group_var)
+
+    # compute GPS measurement stats
+    plot_gps_stats <- parcel_plot_df %>%
+        {
+            if (is.null(parcel_condit)) {
+                .
+            } else {
+                dplyr::filter(
+                    ., 
+                    !!rlang::parse_quo(
+                        parcel_condit, 
+                        env = rlang::global_env()
+                    )
+                )
+            }
+        } %>%
+        {
+            if (is.null(plot_condit)) {
+                .
+            } else {
+                dplyr::filter(
+                    ., 
+                    !!rlang::parse_quo(
+                        plot_condit,
+                        env = rlang::global_env()
+                    )
+                )
+            }
+        } %>%
+        dplyr::mutate(
+            plot = 1,
+            not_measured = dplyr::if_else(
+                condition = (
+                    # case 1: interviewer records not-recorded value
+                    (!!gps_var == not_measured_val) | 
+                    # case 2: SuSo numeric missing value
+                    # TODO: check whether this case is needed
+                    (!!gps_var == -999999999) | 
+                    # case 3: SuSo's extended missing value for Stata
+                    haven::is_tagged_na(!!gps_var) |
+                    # case 4: regular NA
+                    is.na(!!gps_var)
+                ),
+                true = 1,
+                false = 0, 
+                missing = 0
+            )
+        ) %>%
+        dplyr::right_join(cases, by = c("interview__id", "interview__key")) %>%
+        create_dummies(df = ., var = !!why_no_gps_var) %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::summarise(
+            plots = dplyr::n_distinct(interview__id, !!parcel_id_var, !!plot_id_var, na.rm = TRUE),
+            not_measured = sum(not_measured, na.rm = TRUE),
+            dplyr::across(
+                .cols = dplyr::starts_with(paste0(why_no_gps_var_txt, "__")),
+                .fns = ~ sum(.x, na.rm = TRUE)
+            )                    
+        ) %>%
+        dplyr::ungroup() %>%
+        dplyr::mutate(
+            dplyr::across(
+                .cols = starts_with(paste0(why_no_gps_var_txt, "__")),
+                .fns = ~ .x / not_measured
+            ),
+            p_not_measured = not_measured / plots
+        ) %>%
+        replace_nan_inf()
+
+    # compose labels of table columns
+    col_labels1 <- rlang::list2(
+        plots = gt::html("To measure<br>(N)"),
+        not_measured = gt::html("Not measured<br>(N)")
+    )
+    # extract column labels
+    lbls <- extract_var_labels(df = parcel_plot_df, var = !!why_no_gps_var)
+    vals <- extract_var_values(df = parcel_plot_df , var = !!why_no_gps_var)
+    col_labels2 <- create_col_labels(
+        labels = lbls,
+        values = vals,
+        df = plot_gps_stats,
+        pattern = paste0(why_no_gps_var_txt, "_")
+    )
+    # combine column labels
+    col_labels <- c(col_labels1, col_labels2)
+
+    # compose table
+    plot_gps_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Plot GPS area measurement, by team") %>%
+    gt::cols_label(.list = col_labels) %>%
+    gt::fmt_percent(columns = p_not_measured) %>%
+    gt::cols_merge_n_pct(col_n = not_measured, col_pct = p_not_measured) %>%
+    gt::tab_spanner(
+        columns = dplyr::matches(paste0(why_no_gps_var_txt, "_")),
+        label = "Why not measured (%)"
+    ) %>%
+    gt::fmt_number(
+        columns = dplyr::matches(paste0(why_no_gps_var_txt, "_")),
+        decimals = 1,
+        scale_by = 100
+    ) %>%
+    style_table()
+
+}
+
+#' Make crops per plot table
+#' 
+#' @param crop_df Data frame of parcel-plot-crops
+#' @param cases Data frame of cases to include in analysis.
+#' @param parcel_id_var Character. Name of parcel ID column.
+#' @param plot_id_var Character. Name of plot ID column.
+#' @param group_var Character. Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit parcel_gps return
+#' 
+#' @importFrom rlang sym `!!` as_name
+#' @importFrom dplyr `%>%` left_join group_by summarise n_distinct n ungroup mutate
+#' @importFrom gt gt tab_header cols_label html fmt_number
+#' 
+#' @export 
+crops_per_plot <- function(
+    crop_df,
+    cases,
+    parcel_id_var,
+    plot_id_var,
+    group_var
+) {
+
+    # make group variable into symbol for later evaluation
+    parcel_id_var <- rlang::sym(parcel_id_var)
+    plot_id_var <- rlang::sym(plot_id_var)
+    group_var <- rlang::sym(group_var)
+
+    # compute crop stats
+    crop_count_stats <- cases %>%
+        dplyr::left_join(crop_df, by = "interview__id") %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::summarise(
+            n_plots = dplyr::n_distinct(interview__id, !!parcel_id_var, !!plot_id_var),
+            n_crops = dplyr::n()
+        ) %>%
+        dplyr::ungroup() %>%
+        dplyr::mutate(mean_crops = n_crops / n_plots) %>%
+        replace_nan_inf()
+
+    # compose table
+    crop_count_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Number of crops per plot, by team") %>%
+    gt::cols_label(
+        n_plots = gt::html("Plots<br>(N)"),
+        n_crops = gt::html("Crops<br>(N)"),
+        mean_crops = gt::html("Crops per plot<br>(AVG)")
+    ) %>%
+    gt::fmt_number(
+        columns = c(mean_crops),
+        decimals = 1
+    ) %>%
+    style_table()  
+
+}
+
+#' Make crop types tables
+#' 
+#' @param crop_df Data frame of parcel-plot-crops
+#' @param cases Data frame of cases to include in analysis.
+#' @param crop_type_var Charcter. Name of crop type column.
+#' @param temp_crop_val Numeric. Value of temporary crop option.
+#' @param perm_crop_val Numeric. Value of permanent crop option.
+#' @param group_var Character. Name of grouping variable column (e.g., team, region, etc.).
+#' 
+#' @inherit plot_gps return
+#' 
+#' @importFrom rlang sym `!!` as_name
+#' @importFrom dplyr `%>%` left_join group_by mutate if_else group_by summarise n across ungroup starts_with
+#' @importFrom gt gt tab_header cols_label html tab_spanner fmt_number
+#' 
+#' @export 
+crop_types <- function(
+    crop_df,
+    cases,
+    crop_type_var,
+    temp_crop_val = 1,
+    perm_crop_val = 2,
+    group_var
+) {
+
+    # make group variable into symbol for later evaluation
+    crop_type_var <- rlang::sym(crop_type_var)
+    group_var <- rlang::sym(group_var)
+
+    # compute crop stats
+    crop_type_stats <- cases %>%
+        dplyr::left_join(crop_df, by = "interview__id") %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::mutate(
+            crop_temp = dplyr::if_else(!!crop_type_var == temp_crop_val, 1, 0, 0),
+            crop_perm = dplyr::if_else(!!crop_type_var == perm_crop_val, 1, 0, 0)
+        ) %>%
+        dplyr::group_by(!!group_var) %>%
+        dplyr::summarise(
+            n_crops = dplyr::n(),
+            dplyr::across(
+                .cols = c(crop_temp, crop_perm),
+                .fns = ~ sum(.x, na.rm =  TRUE)
+            )
+        ) %>%
+        dplyr::ungroup() %>%
+        dplyr::mutate(
+            dplyr::across(
+                .cols = c(crop_temp, crop_perm),
+                .fns = ~ .x / n_crops
+            )
+        ) %>%
+        replace_nan_inf()
+
+    # compose table
+    crop_type_stats %>%
+    gt::gt(rowname_col = rlang::as_name(group_var)) %>%
+    gt::tab_header(title = "Crop types, by team") %>%
+    gt::cols_label(
+        n_crops = gt::html("Crops<br>(N)"),
+        crop_temp = "Temporary",
+        crop_perm = "Permanent"
+    ) %>%
+    gt::tab_spanner(
+        label = "Type (%)",
+        columns = dplyr::starts_with("crop_")
+    ) %>%
+    gt::fmt_number(
+        columns = dplyr::starts_with("crop_"),
+        decimals = 1,
+        scale_by = 100
+    ) %>%
+    style_table()
+
+}
+```
+
+```{r, identify_cases_to_review}
+
+# create cases to review overall
+cases_to_review <- haven::read_dta(file = paste0(combined_dir, "UHIS_2021.dta")) %>%
+    # complete based on SuSo status
+    dplyr::filter(interview__status %in% statuses_to_reject) %>%
+    # complete based on data
+    dplyr::mutate(
+        complete_aas = (
+            (sample_type == 2) &    # AAS sample
+            (s1bq06a_1 == 1)        # Completed, per the interviewer            
+        ),
+        complete_unps = (
+            (sample_type == 1) &        # UNPS sample
+            (s1bq06a %in% c(1, 2))      # Full interview and full for visit, respectively
+        ),
+        complete_unoma = (
+            (sample_type == 3) &        # UNPS sample
+            (s1bq06a %in% c(1, 2))      # Full interview and full for visit, respectively            
+        ),
+        complete_single_phase = (
+            (s1aq14 == 4) &             # single phase visit type
+            (parcel_posessn_check_s1 == 1)
+        ),
+        complete_full_interview = (
+            (sample_type %in% c(1, 3)) &        # UNPS and UNOMA samples
+            (s1bq06a %in% c(1, 2)) &    # Full interview and full for visit, respectively
+            (s1aq13 == 1) &             # Full interview
+            (s1aq14 %in% c(1, 4))       # first or single-phase visit            
+        )
+    ) %>%
+    dplyr::filter(
+        dplyr::if_any(
+            .cols = c(
+                complete_aas, complete_unps, 
+                complete_single_phase, complete_full_interview
+            ),
+            .fns = ~ .x == 1
+        )
+    ) %>%
+    dplyr::mutate(interview__complete = 1) %>%
+    dplyr::select(
+        interview__id, interview__key, interview__status,
+        PHHID, XHHID, sample_type,
+        complete_aas, complete_unps, complete_unoma, 
+        complete_single_phase, complete_full_interview,
+        interview__complete
+    )
+
+```
+
+```{r, load_filtered_data}
+
+# -----------------------------------------------------------------------------
+# Define function
+# -----------------------------------------------------------------------------
+
+load_filtered <- function(
+    dir,
+    file,
+    name = gsub(pattern = "\\.dta", replacement = "", x = file),
+    filter_df
+) {
+    df <- haven::read_dta(file = paste0(dir, file))
+    
+    df_filtered <- df %>%
+        dplyr::semi_join(filter_df, by = c("interview__id", "interview__key"))
+    
+    assign(
+        x = name,
+        value = df_filtered,
+        envir = .GlobalEnv
+    )
+    
+}
+
+# -----------------------------------------------------------------------------
+# Load filtered files
+# -----------------------------------------------------------------------------
+
+files <- c(
+    "UHIS_2021.dta", "t0_hhroster.dta", 
+    "HH_PARCELS.dta", "AGRIC_PDN_PLOTS_s2_unoma.dta", "PDN_CROPS_s2_unoma.dta",
+    "interview__actions.dta", "interview__comments.dta"
+)
+# TODO: add "suso_diagnostics" once server upgraded
+file_names <- c(
+    "hholds", "members", 
+    "parcels", "plots", "crops",
+    "interview_actions", "comments"
+)
+
+purrr::walk2(
+    .x = files, 
+    .y = file_names,
+    .f = ~ load_filtered(
+        dir = combined_dir,
+        file = .x,
+        name = .y,
+        filter_df = cases_to_review
+    )
+)
+
+parcel_plots <- parcels %>%
+    dplyr::left_join(plots, by = c("interview__id", "interview__key", "HH_PARCELS__id"))
+
+
+```
+
+```{r}
+
+interviewer_responsible <- function(df) {
+
+    responsibles <- df %>%
+        dplyr::group_by(interview__id, interview__key) %>% # group by interview identifiers
+        dplyr::filter(responsible__role == 1) %>% # interviewer provided answers
+        dplyr::filter(dplyr::row_number() == dplyr::n()) %>% # take last obs in group
+        dplyr::ungroup() %>%
+        dplyr::rename(interviewer = responsible__name) %>%
+        dplyr::select(interview__id, interview__key, interviewer, date)
+
+    return(responsibles)
+
+}
+
+supervisor_responsible <- function(df) {
+
+    responsibles <- df %>%
+        dplyr::group_by(interview__id, interview__key) %>% # group by interview identifiers
+        dplyr::filter(responsible__role == 2) %>% # interviewer provided answers
+        dplyr::filter(dplyr::row_number() == dplyr::n()) %>% # take last obs in group
+        dplyr::ungroup() %>%
+        dplyr::rename(supervisor = responsible__name) %>%
+        dplyr::select(interview__id, interview__key, supervisor)
+
+    return(responsibles)
+
+}
+
+supervisors_for_interviews <- supervisor_responsible(df = interview_actions)
+
+interviewers_for_interviews <- interviewer_responsible(df = interview_actions)
+
+cases_w_metadata <- supervisors_for_interviews %>%
+    dplyr::left_join(interviewers_for_interviews, by = c("interview__id", "interview__key")) %>%
+    dplyr::semi_join(cases_to_review, by = c("interview__id", "interview__key")) %>%
+    dplyr::mutate(date = lubridate::as_datetime(date)) %>%
+    dplyr::filter(
+        date %within% 
+        lubridate::interval(
+            start = params$report_start, 
+            end = params$report_end
+        )        
+    )
+
+```
+
+# Progress
+
+TODO
+
+# Response rate
+
+## Overall
+
+TODO
+
+## AAS
+
+TODO
+
+## UNPS/UNOMA
+
+TODO
+
+```{r response_rate, eval=FALSE}
+# UNPS/UNOMA
+s1bq06a %in% c(1, 2) # completed all required 
+s1bq06a %in% c(3, 4) # partially completed required, not filled
+# AAS
+s1bq06a_1 == 1 # completed
+s1bq06a_1 %in% c(2, 3)  # partially completed required, not filled
+
+# why not completed--common to all samples
+s1bq06b
+```
+
+# Members
+
+## Overall
+
+TODO
+
+## AAS
+
+TODO
+
+## UNPS/UNOMA
+
+TODO
+
+# Food consumption
+
+## Number of items
+
+TODO
+
+# Parcels
+
+## Parcels per household
+
+```{r}
+
+my_use_vals <- c(2, 7) # this is UHIS def for ag parcel
+
+parcels_per_hhold(
+    parcel_df = parcels, 
+    cases = cases_w_metadata,
+    parcel_id_var = "HH_PARCELS__id",
+    use_var = "hp2q21_1",
+    use_vals = my_use_vals,
+    group_var = "supervisor"
+)
+```
+
+## Parcel measurement
+
+```{r}
+parcel_gps(
+   parcel_df = dplyr::select(parcels, -apq05_s2_Other), 
+   cases = cases_w_metadata,
+   parcel_condit = "(hp2q21_1__2 > 0 | hp2q21_1__7 > 0 | hp2q21_3==1) & hp2q02 %in% c(1, 2)",
+   gps_var = "apq04_s2",
+   not_measured_val = -97,
+   why_no_gps_var = "apq05_s2",
+   group_var = "supervisor" 
+)
+```
+
+# Plots
+
+## Plots per parcel
+
+```{r}
+plots_per_parcel(
+    parcel_plot_df = parcel_plots,
+    cases = cases_w_metadata,
+    parcel_id_var = "HH_PARCELS__id",
+    group_var = "supervisor"
+)
+```
+
+## Plot use
+
+```{r}
+plot_use(
+    plot_df = dplyr::select(plots, -a3q05_s2_Other),
+    cases = cases_w_metadata,
+    plot_use_var = "a3q05_s2",
+    group_var = "supervisor"
+)
+```
+
+## Plot GPS measurement
+
+```{r}
+
+plot_gps(
+    parcel_plot_df = dplyr::select(parcel_plots, -a3q07_s2_Other),
+    cases = cases_w_metadata,
+    parcel_id_var = "HH_PARCELS__id",
+    plot_id_var = "AGRIC_PDN_PLOTS_s2_unoma__id",
+    parcel_condit = "hp2q21_1__2 > 1 | hp2q21_1__7 > 1 | hp2q21_3==1",
+    plot_condit = "a3q05_s2 %in% c(1, 2) & hp2q02 %in% c(1, 2)",
+    gps_var = "a3q06b_s2",
+    not_measured_val = -97,
+    why_no_gps_var = "a3q07_s2",
+    group_var = "supervisor"
+)
+```
+
+# Crops
+
+## Crops per plot
+
+```{r}
+crops_per_plot(
+    crop_df = crops,
+    cases = cases_w_metadata,
+    parcel_id_var = "HH_PARCELS__id",
+    plot_id_var = "AGRIC_PDN_PLOTS_s2_unoma__id",
+    group_var = "supervisor"
+)
+```
+
+## Crop types
+
+```{r}
+crop_types(
+    crop_df = crops,
+    cases = cases_w_metadata,
+    crop_type_var = "crop_type_s2",
+    group_var = "supervisor"
+)
+```
+
+# Errors
+
+## Most common
+
+```{r errors_freq}
+errors_before <- comments %>%
+    dplyr::filter(stringr::str_starts(variable, "@@Rejected")) %>%
+    tidyr::separate_rows(sep = "\n") %>%
+    dplyr::select(interview__id, interview__key, comment) %>%
+    dplyr::rename(erreur = comment)
+
+errors_now <- haven::read_dta(file = paste0(output_dir, "to_reject_issues.dta")) %>%
+    dplyr::filter(issue_type == 1) %>%
+    dplyr::select(interview__id, interview__key, issue_comment) %>%
+    dplyr::rename(erreur = issue_comment)
+
+errors <- dplyr::bind_rows(errors_before, errors_now) %>%
+    dplyr::distinct(interview__id, interview__key, erreur) %>%
+    dplyr::count(erreur) %>%
+    dplyr::arrange(dplyr::desc(n))
+
+reactable::reactable(
+    data = errors,
+    striped = TRUE,
+    sortable = TRUE, 
+    searchable = TRUE,
+    compact = TRUE,
+    theme = reactableTheme(
+        headerStyle = list(color = "#ffffff", background = "#0F2B1D"),
+        stripedColor = "#edfaea",
+        searchInputStyle = list(
+            backgroundColor = "#edfaea",
+            borderColor = "#8cc0a5",
+            borderWidth = "medium",
+            "&:focus" = list(backgroundColor = "#edfaea", borderWidth = "thick", borderColor = "#0F2B1D"),
+            "&:hover, &:focus" = list(borderWidth = "thick", borderColor = "#8cc0a5"),
+            "&:hover::placeholder, &:focus::placeholder" = list(color = "#8cc0a5")            
+        )
+    ),
+    columns = list(
+        erreur = reactable::colDef(name = "Error"),
+        n = reactable::colDef(name = "Frequence")
+    )    
+)
+```
+
+## Trends
+
+TODO
