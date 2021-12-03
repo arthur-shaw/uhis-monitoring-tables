@@ -60,6 +60,7 @@ statuses_to_reject <- c(100, 120)
 # load libraries whose functions don't have an explicit namespace when used
 library(dplyr)
 library(lubridate)
+library(reactable)
 
 ```
 
@@ -1309,7 +1310,7 @@ reactable::reactable(
     sortable = TRUE, 
     searchable = TRUE,
     compact = TRUE,
-    theme = reactableTheme(
+    theme = reactable::reactableTheme(
         headerStyle = list(color = "#ffffff", background = "#0F2B1D"),
         stripedColor = "#edfaea",
         searchInputStyle = list(
